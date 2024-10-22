@@ -1,0 +1,544 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template for Lambda functions with API Gateway, static website hosting in S3, and CloudFront distribution.
+
+Parameters:
+  ExistingBucketName:
+    Type: String
+    Description: 'Name of an existing S3 bucket. Leave empty to create a new bucket.'
+
+Conditions:
+  CreateNewBucket:
+    Fn::Equals:
+      - !Ref ExistingBucketName
+      - ''
+
+Resources:
+
+  #Database
+  CcFinalProjectUsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: finalproject-users
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S # S stands for String
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH # HASH is the partition key (primary key)
+      BillingMode: PAY_PER_REQUEST # On-demand billing mode, adjust if needed
+      SSESpecification:
+        SSEEnabled: true # Enable server-side encryption for security
+      Tags:
+        - Key: Environment
+          Value: Development
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:*"
+                  - "lambda:*"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource: "*"
+
+  # SignIn Lambda function
+  SignInFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Architectures:
+          - x86_64 # or arm64 based on your needs 
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('finalproject-users')
+
+          def lambda_handler(event, context):
+              body = json.loads(event['body'])
+              email = body['email']
+              password = body['password']
+
+              try:
+                  response = table.get_item(Key={'email': email})
+                  if 'Item' in response:
+                      user = response['Item']
+                      if user['password'] == password:
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({'profileImageUrl': user['profileImageUrl'][8:]}),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',  # Allow any origin
+                                  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                                  'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                                  'Access-Control-Allow-Credentials': 'true'
+                              }   
+                              
+                          }
+                      else:
+                          return {
+                              'statusCode': 401,
+                              'body': json.dumps('Invalid password'),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',  # Allow any origin
+                                  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                                  'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                                  'Access-Control-Allow-Credentials': 'true'
+                              }   
+                          }
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps('User not found'),
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',  # Allow any origin
+                                  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                                  'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                                  'Access-Control-Allow-Credentials': 'true'
+                              }   
+                      }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                      'Access-Control-Allow-Origin': '*',  # Allow any origin
+                      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                      'Access-Control-Allow-Credentials': 'true'
+                  }
+                  }
+
+      FunctionName: SignInFunction
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.12'
+      MemorySize: 128
+      PackageType: Zip
+      Timeout: 15
+
+  # SignUp Lambda function
+  SignUpFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Architectures:
+          - x86_64 # or arm64 based on your needs 
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          s3_client = boto3.client('s3')
+
+          # Create a DynamoDB table object
+          table = dynamodb.Table('finalproject-users')
+
+          def lambda_handler(event, context):
+              # Parse input data from the API Gateway event
+              body = json.loads(event['body'])
+              email = body['email']
+              name = body['name']
+              password = body['password']  # You should hash the password in a real app
+              profile_image = body['profileImage']
+
+              # Check if email already exists in DynamoDB
+              try:
+                  response = table.get_item(Key={'email': email})
+                  if 'Item' in response:
+                      return {
+                          'statusCode': 409,  # Conflict
+                          'body': json.dumps({'error': 'Email is already registered'}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                              'Access-Control-Allow-Credentials': 'true'
+                          }
+                      }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                          'Access-Control-Allow-Credentials': 'true'
+                      }
+                  }
+
+              # Save profile image to S3
+              try:
+                  image_data = base64.b64decode(profile_image)
+                  s3_client.put_object(
+                      Bucket='profile-imagesbucket',
+                      Key=email,
+                      Body=image_data,
+                      ContentType='image/jpeg'
+                  )
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                          'Access-Control-Allow-Credentials': 'true'
+                      }
+                  }
+
+              # Save user details in DynamoDB
+              try:
+                  table.put_item(
+                      Item={
+                          'email': email,
+                          'name': name,
+                          'password': password,
+                          'profileImageUrl': f"https://{s3_client.meta.endpoint_url}/profile-imagesbucket/{email}"
+                      }
+                  )
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                          'Access-Control-Allow-Credentials': 'true'
+                      }
+                  }
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('User registered successfully'),
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                      'Access-Control-Allow-Credentials': 'true'
+                  }
+              }
+      FunctionName: SignUpFunction
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.12'
+      MemorySize: 128
+      PackageType: Zip
+      Timeout: 15
+
+  # UploadImage Lambda function
+  UploadImageFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Architectures:
+          - x86_64 # or arm64 based on your needs 
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              
+              print(f"Event: {event}")
+              print(f"Event type: {event}")
+              
+              # body = json.loads(event['body'])
+              # email = body['email']
+              # profile_image = body['profileImage']
+              
+              email = event['email']
+              profile_image = event['profileImage']
+              print(f"Email: {email}")
+              print(f"Profile Image: {profile_image}")
+
+              # Save profile image to S3
+              try:
+                  image_data = base64.b64decode(profile_image)
+                  s3_client.put_object(
+                      Bucket='profile-imagesbucket',
+                      Key=email,
+                      Body=image_data,
+                      ContentType='image/jpeg'
+                  )
+                  image_url = f"https://{s3_client.meta.endpoint_url}/profile-imagesbucket/{email}"
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Image uploaded successfully', 'imageUrl': image_url}),
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',  # Allow any origin
+                      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                      'Access-Control-Allow-Credentials': 'true'
+                  }
+                  }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e), 'imageUrl': image_url, 'email': email}),
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',  # Allow any origin
+                      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',  # Allowed methods
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization',  # Allowed headers
+                      'Access-Control-Allow-Credentials': 'true'
+                  }
+                  }
+ 
+      FunctionName: UploadImageFunction
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.12'
+      MemorySize: 128
+      PackageType: Zip
+      Timeout: 15
+
+  # API Gateway
+  APIGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: LambdaAPIGateway
+
+  # SignIn API Resource and Method
+  SignInResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt APIGatewayRestApi.RootResourceId
+      PathPart: 'signin'
+      RestApiId: !Ref APIGatewayRestApi
+
+  SignInMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref SignInResource 
+      RestApiId: !Ref APIGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SignInFunction.Arn}/invocations
+
+  # SignUp API Resource and Method
+  SignUpResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt APIGatewayRestApi.RootResourceId
+      PathPart: 'signup'
+      RestApiId: !Ref APIGatewayRestApi
+
+  SignUpMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref SignUpResource
+      RestApiId: !Ref APIGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SignUpFunction.Arn}/invocations
+
+  # UploadImage API Resource and Method
+  UploadImageResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt APIGatewayRestApi.RootResourceId
+      PathPart: 'uploadimage'
+      RestApiId: !Ref APIGatewayRestApi
+
+  UploadImageMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref UploadImageResource
+      RestApiId: !Ref APIGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadImageFunction.Arn}/invocations
+
+  # Grant permission to Lambda functions to be invoked by API Gateway
+  SignInLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref SignInFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+  SignUpLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref SignUpFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+  UploadImageLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref UploadImageFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+
+  # S3 Bucket for hosting static website (with optional creation)
+  FrontEndBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: CreateNewBucket
+    Properties:
+      BucketName: 'front-buckets3'
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+
+  # CloudFront Distribution for S3 Bucket
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !If
+              - CreateNewBucket
+              - !GetAtt FrontEndBucket.RegionalDomainName
+              - !Sub "${ExistingBucketName}.s3.amazonaws.com"
+            Id: 'S3Origin'
+            S3OriginConfig: {}
+        Enabled: 'true'
+        DefaultRootObject: 'index.html'
+        DefaultCacheBehavior:
+          TargetOriginId: 'S3Origin'
+          ViewerProtocolPolicy: 'redirect-to-https'
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: 'none'
+
+  #options for the cors problem
+  SignInOptionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: OPTIONS
+      ResourceId: !Ref SignInResource
+      RestApiId: !Ref APIGatewayRestApi
+      AuthorizationType: NONE
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+
+  SignUpOptionMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: OPTIONS
+        ResourceId: !Ref SignUpResource
+        RestApiId: !Ref APIGatewayRestApi
+        AuthorizationType: NONE
+        Integration:
+          IntegrationResponses:
+            - StatusCode: 200
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+                method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+          Type: MOCK
+        MethodResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+  
+  UploadImageOptionMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: OPTIONS
+        ResourceId: !Ref UploadImageResource
+        RestApiId: !Ref APIGatewayRestApi
+        AuthorizationType: NONE
+        Integration:
+          IntegrationResponses:
+            - StatusCode: 200
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+                method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+          Type: MOCK
+        MethodResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+
+  #to create stage 
+  ApiGatewayDeployment:
+      Type: AWS::ApiGateway::Deployment
+      Properties:
+        RestApiId: !Ref APIGatewayRestApi
+        StageName: dev
+      DependsOn:
+        - SignInMethod
+        - SignUpMethod
+        - UploadImageMethod
+        - SignInOptionMethod
+        - SignUpOptionMethod
+        - UploadImageOptionMethod
+        
+
+Outputs:
+  ApiGatewayURL:
+    Description: 'API Gateway URL'
+    Value: !Sub 'https://${APIGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  CloudFrontURL:
+    Description: 'The CloudFront URL to access the static website'
+    Value: !GetAtt CloudFrontDistribution.DomainName
